@@ -1,0 +1,196 @@
+# lookup SSH public keys by name
+data "ibm_is_ssh_key" "ssh_pub_key" {
+  name = var.ssh_key_name
+}
+
+# lookup compute profile by name
+data "ibm_is_instance_profile" "instance_profile" {
+  name = var.instance_profile
+}
+
+# create a random password if we need it
+resource "random_password" "password" {
+  length           = 16
+  special          = true
+  override_special = "_%@"
+}
+
+locals {
+  do_byol_license = <<EOD
+
+    schemaVersion: 1.0.0
+    class: Device
+    async: true
+    label: Cloudinit Onboarding
+    Common:
+      class: Tenant
+      byoLicense:
+        class: License
+        licenseType: regKey
+        regKey: ${var.byol_license_basekey}
+EOD
+  do_regekypool   = <<EOD
+
+    schemaVersion: 1.0.0
+    class: Device
+    async: true
+    label: Cloudinit Onboarding
+    Common:
+      class: Tenant
+      poolLicense:
+        class: License
+        licenseType: licensePool
+        bigIqHost: ${var.license_host}
+        bigIqUsername: ${var.license_username}
+        bigIqPassword: ${var.license_password}
+        licensePool: ${var.license_pool}
+        reachable: false
+        hypervisor: kvm
+EOD
+  do_utilitypool  = <<EOD
+
+    schemaVersion: 1.0.0
+    class: Device
+    async: true
+    label: Cloudinit Onboarding
+    Common:
+      class: Tenant
+      utilityLicense:
+        class: License
+        licenseType: licensePool
+        bigIqHost: ${var.license_host}
+        bigIqUsername: ${var.license_username}
+        bigIqPassword: ${var.license_password}
+        licensePool: ${var.license_pool}
+        skuKeyword1: ${var.license_sku_keyword_1}
+        skuKeyword2: ${var.license_sku_keyword_2}
+        unitOfMeasure: ${var.license_unit_of_measure}
+        reachable: false
+        hypervisor: kvm
+EOD
+}
+
+locals {
+  template_file = file("${path.module}/user_data.yaml")
+  # user admin_password if supplied, else set a random password
+  admin_password = var.tmos_admin_password == "" ? random_password.password.result : var.tmos_admin_password
+  # set user_data YAML values or else set them to null for templating
+  do_declaration_url   = var.do_declaration_url == "" ? "null" : var.do_declaration_url
+  as3_declaration_url  = var.as3_declaration_url == "" ? "null" : var.as3_declaration_url
+  ts_declaration_url   = var.ts_declaration_url == "" ? "null" : var.ts_declaration_url
+  phone_home_url       = var.phone_home_url == "" ? "null" : var.phone_home_url
+  tgactive_url         = var.tgactive_url == "" ? "null" : var.tgactive_url
+  tgstandby_url        = var.tgstandby_url == "" ? "null" : var.tgstandby_url
+  tgrefresh_url        = var.tgrefresh_url == "" ? "null" : var.tgrefresh_url
+  do_dec1              = var.license_type == "byol" ? chomp(local.do_byol_license) : "null"
+  do_dec2              = var.license_type == "regkeypool" ? chomp(local.do_regekypool) : local.do_dec1
+  do_local_declaration = var.license_type == "utilitypool" ? chomp(local.do_utilitypool) : local.do_dec2
+  # default_route_interface
+  default_route_interface = var.default_route_interface == "" ? "1.${length(local.secondary_subnets)}" : var.default_route_interface
+}
+
+# discovery the 1st address on the default route subnet because IBM does not
+# supply the DHCPv4 routers option correctly on non-primary interfaces. This
+# is a bug in IBM they need to fix.
+data "ibm_is_subnet" "default_route_subnet" {
+  identifier = element(local.secondary_subnets, length(local.secondary_subnets) - 1)
+}
+# IBM does not tell you what the default gateway address for each subnet should
+# be, but by undocumented convention we will use the 1st host address in the subnet
+locals {
+  default_gateway_ipv4_address = cidrhost(data.ibm_is_subnet.default_route_subnet.ipv4_cidr_block, 1)
+}
+
+data "template_file" "user_data" {
+  template = local.template_file
+  vars = {
+    tmos_admin_password     = local.admin_password
+    configsync_interface    = "1.1"
+    hostname                = var.hostname
+    domain                  = var.domain
+    default_route_interface = local.default_route_interface
+    default_route_gateway   = local.default_gateway_ipv4_address
+    do_local_declaration    = local.do_local_declaration
+    do_declaration_url      = local.do_declaration_url
+    as3_declaration_url     = local.as3_declaration_url
+    ts_declaration_url      = local.ts_declaration_url
+    phone_home_url          = local.phone_home_url
+    tgactive_url            = local.tgactive_url
+    tgstandby_url           = local.tgstandby_url
+    tgrefresh_url           = local.tgrefresh_url
+    template_source         = var.template_source
+    template_version        = var.template_version
+    zone                    = data.ibm_is_subnet.f5_management_subnet.zone
+    vpc                     = data.ibm_is_subnet.f5_management_subnet.vpc
+    app_id                  = var.app_id
+  }
+}
+
+##############################################
+### create compute instance                ###
+##############################################
+
+# create compute instance
+resource "ibm_is_instance" "f5_ve_instance" {
+  name           = var.instance_name
+  resource_group = data.ibm_resource_group.group.id
+  image          = local.image_id
+  profile        = data.ibm_is_instance_profile.instance_profile.id
+
+
+##############################################
+### Anexar VNI na VSI   -  Rafael Oliveira ###
+##############################################
+
+  primary_network_attachment {
+    name = "management"
+      virtual_network_interface {
+        id = ibm_is_virtual_network_interface.rip_vnic_vsi.id
+        #id = data.ibm_is_virtual_network_interfaces.vni_list.virtual_network_interfaces.id[1]
+      }
+  }
+
+  vpc        = data.ibm_is_subnet.f5_management_subnet.vpc
+  zone       = data.ibm_is_subnet.f5_management_subnet.zone
+  keys       = [data.ibm_is_ssh_key.ssh_pub_key.id]
+  user_data  = data.template_file.user_data.rendered
+  depends_on = [ibm_is_security_group_rule.f5_allow_outbound]
+  timeouts {
+    create = "60m"
+    delete = "120m"
+  }
+}
+
+#resource "ibm_is_instance_network_attachment" "rip_vnic2_vsi" {
+#  instance = ibm_is_instance.f5_ve_instance.id
+#  virtual_network_interface {
+#    id = ibm_is_virtual_network_interface.rip_vnic2_vsi.id
+#  }
+#}
+
+resource "ibm_is_instance_network_attachment" "rip_vnic3_vsi" {
+  instance = ibm_is_instance.f5_ve_instance.id
+  name = "external"
+  virtual_network_interface {
+    id = ibm_is_virtual_network_interface.rip_vnic3_vsi.id
+  }
+}
+
+locals {
+  vs_interface_index   = length(ibm_is_instance.f5_ve_instance.network_interfaces) - 1
+  snat_interface_index = length(ibm_is_instance.f5_ve_instance.network_interfaces) < 3 ? 0 : 1
+}
+
+resource "ibm_is_floating_ip" "f5_management_floating_ip" {
+  name           = "fmgmt-${random_uuid.namer.result}"
+  resource_group = data.ibm_resource_group.group.id
+  count          = var.bigip_management_floating_ip ? 1 : 0
+  target         = ibm_is_instance.f5_ve_instance.primary_network_interface.0.id
+}
+
+resource "ibm_is_floating_ip" "f5_external_floating_ip" {
+  name           = "fext-${random_uuid.namer.result}"
+  resource_group = data.ibm_resource_group.group.id
+  count          = local.external_floating_ip ? 1 : 0
+  target         = element(ibm_is_instance.f5_ve_instance.network_interfaces.*.id, local.vs_interface_index)
+}
